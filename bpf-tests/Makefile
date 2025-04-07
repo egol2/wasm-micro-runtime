@@ -11,4 +11,4 @@ APP = binary-func-writer
 all: $(APP)
 
 $(APP): $(APP).c
-	$(CC) $(CFLAGS) $(INCLUDES) $< $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(LDFLAGS) -o $@.o
