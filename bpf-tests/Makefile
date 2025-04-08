@@ -7,8 +7,12 @@ LDFLAGS=-lopcodes
 
 # Enter program link
 APP = binary-func-writer
+APP2 = execution-tester
 
-all: $(APP)
+all: $(APP) $(APP2)
 
 $(APP): $(APP).c
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(LDFLAGS) -o $@.o
+
+$(APP2): $(APP2).c
 	$(CC) $(CFLAGS) $(INCLUDES) $< $(LDFLAGS) -o $@.o

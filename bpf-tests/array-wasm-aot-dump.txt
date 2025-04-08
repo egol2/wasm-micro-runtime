@@ -1,0 +1,95 @@
+
+array-aot.o:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000000000 <aot_func#0>:
+   0:	c3                   	ret
+   1:	66 66 66 66 66 66 2e 	data16 data16 data16 data16 data16 cs nopw 0x0(%rax,%rax,1)
+   8:	0f 1f 84 00 00 00 00 
+   f:	00 
+
+0000000000000010 <aot_func#1>:
+  10:	55                   	push   %rbp
+  11:	41 57                	push   %r15
+  13:	41 56                	push   %r14
+  15:	41 55                	push   %r13
+  17:	41 54                	push   %r12
+  19:	53                   	push   %rbx
+  1a:	48 83 ec 38          	sub    $0x38,%rsp
+  1e:	48 8b 5f 10          	mov    0x10(%rdi),%rbx
+  22:	4c 8b 77 30          	mov    0x30(%rdi),%r14
+  26:	44 8b ab d0 01 00 00 	mov    0x1d0(%rbx),%r13d
+  2d:	45 8d 65 f0          	lea    -0x10(%r13),%r12d
+  31:	be 0d 00 00 00       	mov    $0xd,%esi
+  36:	4d 39 e6             	cmp    %r12,%r14
+  39:	0f 83 dc 00 00 00    	jae    11b <aot_func#1+0x10b>
+  3f:	48 89 fd             	mov    %rdi,%rbp
+  42:	48 8b 47 38          	mov    0x38(%rdi),%rax
+  46:	4c 39 e0             	cmp    %r12,%rax
+  49:	73 0a                	jae    55 <aot_func#1+0x45>
+  4b:	be 0e 00 00 00       	mov    $0xe,%esi
+  50:	e9 c6 00 00 00       	jmp    11b <aot_func#1+0x10b>
+  55:	48 89 44 24 08       	mov    %rax,0x8(%rsp)
+  5a:	48 8b 4d 18          	mov    0x18(%rbp),%rcx
+  5e:	48 8b 83 78 01 00 00 	mov    0x178(%rbx),%rax
+  65:	44 89 a3 d0 01 00 00 	mov    %r12d,0x1d0(%rbx)
+  6c:	48 89 44 24 10       	mov    %rax,0x10(%rsp)
+  71:	41 c7 44 04 0c 00 00 	movl   $0x0,0xc(%r12,%rax,1)
+  78:	00 00 
+  7a:	41 8d 45 fc          	lea    -0x4(%r13),%eax
+  7e:	c5 f9 6f 05 00 00 00 	vmovdqa 0x0(%rip),%xmm0        # 86 <aot_func#1+0x76>
+  85:	00 
+  86:	c4 e3 79 22 c0 01    	vpinsrd $0x1,%eax,%xmm0,%xmm0
+  8c:	c5 f9 7f 44 24 20    	vmovdqa %xmm0,0x20(%rsp)
+  92:	48 89 4c 24 18       	mov    %rcx,0x18(%rsp)
+  97:	c5 f9 d6 01          	vmovq  %xmm0,(%rcx)
+  9b:	45 31 ff             	xor    %r15d,%r15d
+  9e:	48 89 ef             	mov    %rbp,%rdi
+  a1:	31 f6                	xor    %esi,%esi
+  a3:	ba 02 00 00 00       	mov    $0x2,%edx
+  a8:	e8 00 00 00 00       	call   ad <aot_func#1+0x9d>
+  ad:	48 8b 4c 24 18       	mov    0x18(%rsp),%rcx
+  b2:	8b 01                	mov    (%rcx),%eax
+  b4:	48 85 c0             	test   %rax,%rax
+  b7:	74 46                	je     ff <aot_func#1+0xef>
+  b9:	48 8b 54 24 10       	mov    0x10(%rsp),%rdx
+  be:	8b 04 02             	mov    (%rdx,%rax,1),%eax
+  c1:	ff c0                	inc    %eax
+  c3:	41 89 44 14 08       	mov    %eax,0x8(%r12,%rdx,1)
+  c8:	41 8d 45 f8          	lea    -0x8(%r13),%eax
+  cc:	89 41 08             	mov    %eax,0x8(%rcx)
+  cf:	c5 f9 6f 44 24 20    	vmovdqa 0x20(%rsp),%xmm0
+  d5:	c5 f9 d6 01          	vmovq  %xmm0,(%rcx)
+  d9:	48 c7 41 0c 00 00 00 	movq   $0x0,0xc(%rcx)
+  e0:	00 
+  e1:	48 89 ef             	mov    %rbp,%rdi
+  e4:	be 01 00 00 00       	mov    $0x1,%esi
+  e9:	ba 05 00 00 00       	mov    $0x5,%edx
+  ee:	e8 00 00 00 00       	call   f3 <aot_func#1+0xe3>
+  f3:	be 0d 00 00 00       	mov    $0xd,%esi
+  f8:	4d 39 ee             	cmp    %r13,%r14
+  fb:	72 12                	jb     10f <aot_func#1+0xff>
+  fd:	eb 1c                	jmp    11b <aot_func#1+0x10b>
+  ff:	41 bf ff ff ff ff    	mov    $0xffffffff,%r15d
+ 105:	be 0d 00 00 00       	mov    $0xd,%esi
+ 10a:	4d 39 ee             	cmp    %r13,%r14
+ 10d:	73 0c                	jae    11b <aot_func#1+0x10b>
+ 10f:	be 0e 00 00 00       	mov    $0xe,%esi
+ 114:	4c 39 6c 24 08       	cmp    %r13,0x8(%rsp)
+ 119:	73 1d                	jae    138 <aot_func#1+0x128>
+ 11b:	48 89 df             	mov    %rbx,%rdi
+ 11e:	e8 00 00 00 00       	call   123 <aot_func#1+0x113>
+ 123:	45 31 ff             	xor    %r15d,%r15d
+ 126:	44 89 f8             	mov    %r15d,%eax
+ 129:	48 83 c4 38          	add    $0x38,%rsp
+ 12d:	5b                   	pop    %rbx
+ 12e:	41 5c                	pop    %r12
+ 130:	41 5d                	pop    %r13
+ 132:	41 5e                	pop    %r14
+ 134:	41 5f                	pop    %r15
+ 136:	5d                   	pop    %rbp
+ 137:	c3                   	ret
+ 138:	44 89 ab d0 01 00 00 	mov    %r13d,0x1d0(%rbx)
+ 13f:	eb e5                	jmp    126 <aot_func#1+0x116>

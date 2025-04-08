@@ -1,19 +1,17 @@
-#define _GNU_SOURCE /* asprintf, vasprintf */
-
+#define _GNU_SOURCE
+#include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
+#include <time.h>
+#include <sys/mman.h>
 #include <dis-asm.h>
-
-static const char BPF_FILE[] = "non-inlined-bpf-array.o";
 
 typedef struct {
     char *insn_buffer;
@@ -60,6 +58,7 @@ static int dis_fprintf_styled(void *stream, enum disassembler_style style, const
     return 0;
 }
 
+/* Utility function to get file size. */
 int fileSize(int fd) {
     struct stat s;
     if (fstat(fd, &s) == -1) {
@@ -69,13 +68,15 @@ int fileSize(int fd) {
 }
 
 /*
- * This modified main() reads a flat binary file, uses the disassembler
- * to iterate over instructions, and for each direct call (opcode 0xE8)
- * it computes a new relative offset so that the call instead goes to our stub.
- * The stub function’s machine code is appended to the end of the new binary.
+ * patch_binary:
+ *
+ *   Reads the input file (binary to patch), disassembles it instruction-by-instruction,
+ *   and patches any direct call (opcode 0xE8) by computing a new relative offset 
+ *   so that the call targets our stub function. It then appends the stub (a minimal function)
+ *   to the end and writes the new binary to output_file.
  */
-int main(int argc, char const *argv[]) {
-    int fd = open(BPF_FILE, O_RDONLY);
+int patch_binary(const char *input_file, const char *output_file) {
+    int fd = open(input_file, O_RDONLY);
     if (fd < 0) {
         perror("open input file");
         return 1;
@@ -102,7 +103,7 @@ int main(int argc, char const *argv[]) {
         return 1;
     }
     close(fd);
-    
+
     /* Define the stub function machine code.
      * stub_call:
      *   push rbp         (0x55)
@@ -112,7 +113,7 @@ int main(int argc, char const *argv[]) {
      */
     uint8_t stub_code[] = {0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3};
     size_t stub_size = sizeof(stub_code);
-    
+
     /* The new binary will contain the original code (possibly patched)
      * plus the stub function appended at the end.
      */
@@ -124,12 +125,16 @@ int main(int argc, char const *argv[]) {
         return 1;
     }
     
-    /* Set up the disassembler info so we can step through instructions. */
+    /* Set up the disassembler info so we can process instructions. */
     size_t pc = 0;      /* offset into the input buffer */
     size_t out_pc = 0;  /* offset into the new (output) buffer */
     
     stream_state ss = {0};
-    disassemble_info disasm_info = {0};
+    ss.insn_buffer = NULL;
+    ss.reenter = false;
+    
+    disassemble_info disasm_info;
+    memset(&disasm_info, 0, sizeof(disasm_info));
     init_disassemble_info(&disasm_info, &ss, dis_fprintf, dis_fprintf_styled);
     disasm_info.arch = bfd_arch_i386;
     disasm_info.mach = bfd_mach_x86_64;
@@ -153,15 +158,13 @@ int main(int argc, char const *argv[]) {
             break;
         }
         
-        /* Check if this instruction is a direct call.
-         * (Direct calls use opcode 0xE8 and are 5 bytes long.)
-         */
+        /* Check if this instruction is a direct call (opcode 0xE8) and has a length of at least 5. */
         if (buffer[pc] == 0xE8 && insn_size >= 5) {
             /* Compute new relative offset so that the call goes to our stub.
-             * Our stub will be appended at offset "size" in the new binary.
              * The call instruction computes its target relative to (pc + insn_size).
+             * Our stub is appended at offset "size" of the new binary.
              */
-            int32_t new_offset = (int32_t)((size) - (pc + insn_size));
+            int32_t new_offset = (int32_t)(size - (pc + insn_size));
             new_buffer[out_pc++] = 0xE8;
             new_buffer[out_pc++] = (uint8_t)(new_offset & 0xFF);
             new_buffer[out_pc++] = (uint8_t)((new_offset >> 8) & 0xFF);
@@ -182,19 +185,19 @@ int main(int argc, char const *argv[]) {
         }
     }
     
-    /* Append the stub function code to the end of the new binary. */
+    /* Append the stub function code at the end of the new binary. */
     memcpy(new_buffer + out_pc, stub_code, stub_size);
     out_pc += stub_size;
     
-    /* Write out the new binary (with .o extension). */
-    int out_fd = open("bpf-binary-patched.o", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    /* Write out the new binary. */
+    int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (out_fd < 0) {
         perror("open output file");
         free(buffer);
         free(new_buffer);
         return 1;
     }
-    if (write(out_fd, new_buffer, out_pc) != out_pc) {
+    if (write(out_fd, new_buffer, out_pc) != (ssize_t)out_pc) {
         perror("write output file");
         free(buffer);
         free(new_buffer);
@@ -205,6 +208,89 @@ int main(int argc, char const *argv[]) {
     
     free(buffer);
     free(new_buffer);
+    return 0;
+}
+
+int run_timing_loop(const char *patched_file, int num_runs) {
+    int fd = open(patched_file, O_RDONLY);
+    if (fd < 0) {
+        perror("open patched binary");
+        return 1;
+    }
+    
+    int size = fileSize(fd);
+    if (size < 0) {
+        perror("fileSize");
+        close(fd);
+        return 1;
+    }
+    
+    void *pointer = mmap(NULL, size, PROT_EXEC, MAP_SHARED, fd, 0);
+    if (pointer == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    
+    void (*fptr)() = (void (*)()) pointer;
+    
+    struct timespec start, end;
+    if (clock_gettime(CLOCK_REALTIME, &start) != 0) {
+        perror("clock_gettime start");
+        munmap(pointer, size);
+        return 1;
+    }
+    
+    for (int i = 0; i < num_runs; i++) {
+        fptr();
+    }
+    
+    if (clock_gettime(CLOCK_REALTIME, &end) != 0) {
+        perror("clock_gettime end");
+        munmap(pointer, size);
+        return 1;
+    }
+    
+    long long start_ns = start.tv_sec * 1000000000LL + start.tv_nsec;
+    long long end_ns = end.tv_sec * 1000000000LL + end.tv_nsec;
+    long long elapsed_ns = end_ns - start_ns;
+    double average_ns = (double) elapsed_ns / num_runs;
+    
+    printf("Executed patched binary %d times\n", num_runs);
+    printf("Total elapsed time: %lld ns\n", elapsed_ns);
+    printf("Average time per execution: %.2f ns\n", average_ns);
+    
+    munmap(pointer, size);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <input_binary> <num_runs>\n", argv[0]);
+        return 1;
+    }
+    
+    const char *input_file = argv[1];
+    int num_runs = atoi(argv[2]);
+    if (num_runs <= 0) {
+        fprintf(stderr, "Number of runs must be positive.\n");
+        return 1;
+    }
+    
+    const char *patched_file = "bpf-binary-patched.o";
+    
+    /* Patch the input binary. */
+    if (patch_binary(input_file, patched_file) != 0) {
+        fprintf(stderr, "Error patching the binary.\n");
+        return 1;
+    }
+    
+    /* Run the patched binary in a timing loop. */
+    if (run_timing_loop(patched_file, num_runs) != 0) {
+        fprintf(stderr, "Error running the timing loop.\n");
+        return 1;
+    }
     
     return 0;
 }
