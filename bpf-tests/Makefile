@@ -1,5 +1,6 @@
 CC=gcc
-CFLAGS=-g
+# CFLAGS=-g -O0
+CFLAGS=-O3
 #CFLAGS+=-L`realpath /linux/tools/lib/bpf`
 #INCLUDES=-I`realpath /linux/tools/lib` -I`realpath /linux/usr/include` -I`realpath /linux/include` -I`realpath /linux/arch/x86/include`
 #LDFLAGS=-lbpf

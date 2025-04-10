@@ -10,7 +10,7 @@ typedef uint64_t __u64;
 #define BPF_MAP_TYPE_ARRAY 0
 #define BPF_ANY          0
 
-static __u32 ar[256] SEC(".maps") = { 0 };
+static __u32 ar[256] = { 0 };
 
 void *bpf_map_lookup_elem(void *map, const void *key);
 int bpf_map_update_elem(void *map, const void *key, const void *value, __u64 flags);
@@ -28,4 +28,3 @@ int array(void *ctx)
     }
     return 0;
 }
-
