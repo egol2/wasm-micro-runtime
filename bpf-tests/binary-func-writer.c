@@ -1,3 +1,13 @@
+// binary_rewriter.c – single tool that can patch & benchmark WASM, C or eBPF
+// blobs.
+// -----------------------------------------------------------------------------
+// Build:
+//      gcc -O2 -Wall -Wextra -o binary_rewriter binary_rewriter.c -lbfd
+//      -lopcodes
+// Usage:
+//      ./binary_rewriter <mode> <input_file> <num_runs>
+//          <mode> ∈ { wasm | c | ebpf }
+// -----------------------------------------------------------------------------
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdarg.h>
@@ -9,366 +19,443 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <time.h>
-// #include <sys/times.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <dis-asm.h>
+#include <elf.h>
+
+// ----------------------------------------------------------------------------
+// Shared helpers
+// ----------------------------------------------------------------------------
+
+typedef uint32_t __u32;
+static __u32 ar[256] = { 0 }; // buffer returned by the stub in every mode
+
+static unsigned long long
+rdtscl(void)
+{
+    unsigned int lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long long)lo) | (((unsigned long long)hi) << 32);
+}
 
 typedef struct {
     char *insn_buffer;
     bool reenter;
 } stream_state;
 
-// timer helper function for TSC (time stamp counter)
-// https://stackoverflow.com/questions/14017894/time-calculation-with-tsc-time-stamp-counter
-// and
-// https://stackoverflow.com/questions/13772567/how-to-get-the-cpu-cycle-count-in-x86-64-from-c/64898073#64898073
-unsigned long long rdtscl(void)
+static int
+dis_fprintf(void *s, const char *f, ...)
 {
-    unsigned int lo, hi;
-    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
-    return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
-}
-
-// definition for inside the wasm executable
-typedef uint32_t __u32;
-static __u32 ar[256] = { 0 };
-
-static int dis_fprintf(void *stream, const char *fmt, ...) {
-    // stream_state *ss = (stream_state *)stream;
-    // va_list arg;
-    // va_start(arg, fmt);
-    // if (!ss->reenter) {
-    //     vasprintf(&ss->insn_buffer, fmt, arg);
-    //     ss->reenter = true;
-    // } else {
-    //     char *tmp;
-    //     vasprintf(&tmp, fmt, arg);
-    //     char *tmp2;
-    //     asprintf(&tmp2, "%s%s", ss->insn_buffer, tmp);
-    //     free(ss->insn_buffer);
-    //     free(tmp);
-    //     ss->insn_buffer = tmp2;
-    // }
-    // va_end(arg);
+    (void)s;
+    (void)f;
     return 0;
 }
-
-static int dis_fprintf_styled(void *stream, enum disassembler_style style, const char *fmt, ...) {
-    // stream_state *ss = (stream_state *)stream;
-    // va_list arg;
-    // va_start(arg, fmt);
-    // if (!ss->reenter) {
-    //     vasprintf(&ss->insn_buffer, fmt, arg);
-    //     ss->reenter = true;
-    // } else {
-    //     char *tmp;
-    //     vasprintf(&tmp, fmt, arg);
-    //     char *tmp2;
-    //     asprintf(&tmp2, "%s%s", ss->insn_buffer, tmp);
-    //     free(ss->insn_buffer);
-    //     free(tmp);
-    //     ss->insn_buffer = tmp2;
-    // }
-    // va_end(arg);
+static int
+dis_fprintf_styled(void *s, enum disassembler_style st, const char *f, ...)
+{
+    (void)s;
+    (void)st;
+    (void)f;
     return 0;
 }
-
-/* Utility function to get file size. */
-int fileSize(int fd) {
-    struct stat s;
-    if (fstat(fd, &s) == -1) {
-        return -1;
-    }
-    return s.st_size;
+static int
+file_size(int fd)
+{
+    struct stat st;
+    return fstat(fd, &st) == -1 ? -1 : (int)st.st_size;
 }
 
-/*
- * patch_binary:
- *
- *   Reads the input file (binary to patch), disassembles it instruction-by-instruction,
- *   and patches any direct call (opcode 0xE8) by computing a new relative offset
- *   so that the call targets our stub function. It then appends the stub (a minimal function)
- *   to the end and writes the new binary to output_file.
+/* Stub = movabs rax,&ar ; ret */
+static void
+build_stub(uint8_t out[11])
+{
+    uint64_t ptr = (uint64_t)&ar;
+    out[0] = 0x48; // movabs
+    out[1] = 0xB8; // rax
+    memcpy(out + 2, &ptr, 8); // address of ar
+    out[10] = 0xC3; // ret
+}
+
+//-------------------------------- ELF loader ---------------------------------
+/* Loads the .text section of an ELF64 file into memory.
+ * On success returns 0 and sets *buf / *len (caller must free).
  */
-int patch_binary(const char *input_file, const char *output_file) {
-    int fd = open(input_file, O_RDONLY);
+static int
+load_elf_text(const char *path, uint8_t **buf_out, size_t *len_out)
+{
+    int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        perror("open input file");
+        perror("open");
         return 1;
     }
-    int size = fileSize(fd);
-    if (size < 0) {
-        perror("fileSize");
+
+    Elf64_Ehdr eh;
+    if (pread(fd, &eh, sizeof eh, 0) != sizeof eh
+        || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "%s: not ELF\n", path);
         close(fd);
         return 1;
     }
 
-    uint8_t *buffer = malloc(size);
-    if (!buffer) {
-        perror("malloc");
+    off_t shstr_off = eh.e_shoff + (off_t)eh.e_shstrndx * eh.e_shentsize;
+    Elf64_Shdr shstr;
+    if (pread(fd, &shstr, sizeof shstr, shstr_off) != sizeof shstr) {
+        perror("shstr");
+        close(fd);
+        return 1;
+    }
+    char *shstrtab = malloc(shstr.sh_size);
+    if (!shstrtab
+        || pread(fd, shstrtab, shstr.sh_size, shstr.sh_offset)
+               != (ssize_t)shstr.sh_size) {
+        perror("shstrtab");
+        free(shstrtab);
         close(fd);
         return 1;
     }
 
-    ssize_t bytesRead = read(fd, buffer, size);
-    if (bytesRead != size) {
-        perror("read");
-        free(buffer);
+    Elf64_Shdr text = { 0 };
+    for (uint16_t i = 0; i < eh.e_shnum; ++i) {
+        Elf64_Shdr sh;
+        off_t ofs = eh.e_shoff + (off_t)i * eh.e_shentsize;
+        if (pread(fd, &sh, sizeof sh, ofs) != sizeof sh) {
+            perror("shdr");
+            free(shstrtab);
+            close(fd);
+            return 1;
+        }
+        if (strcmp(shstrtab + sh.sh_name, ".text") == 0) {
+            text = sh;
+            break;
+        }
+    }
+    free(shstrtab);
+    if (text.sh_size == 0) {
+        fprintf(stderr, "%s: .text not found\n", path);
+        close(fd);
+        return 1;
+    }
+
+    uint8_t *buf = malloc(text.sh_size);
+    if (!buf
+        || pread(fd, buf, text.sh_size, text.sh_offset)
+               != (ssize_t)text.sh_size) {
+        perror("load .text");
+        free(buf);
         close(fd);
         return 1;
     }
     close(fd);
-
-    // printf("buffer original:\n");
-    // for (size_t i = 0; i < size; i++) {
-    //     printf("0x%02X ", buffer[i]);
-    //     if ((i + 1) % 16 == 0)
-    //         printf("\n");
-    // }
-    // printf("\n");
-
-    /* Define the stub function machine code that returns the address of the global array 'ar'.
-     * This stub will execute:
-     *    movabs rax, <address of ar>  (opcode: 48 B8 <imm64>)
-     *    ret                        (opcode: C3)
-     */
-    uint8_t stub_code[11] = {
-        0x48, 0xB8,       // movabs rax, imm64
-        0, 0, 0, 0, 0, 0, 0, 0, // placeholder for the 8-byte address of 'ar'
-        0xC3              // ret
-    };
-
-    // Fill in the immediate field with the address of the global array variable 'ar'
-    uint64_t ptr = (uint64_t)&ar;
-    memcpy(stub_code + 2, &ptr, sizeof(ptr));
-    size_t stub_size = sizeof(stub_code);
-
-    /* The new binary will contain the original code (possibly patched)
-     * plus the stub function appended at the end.
-     */
-    size_t new_size = size + stub_size;
-    uint8_t *new_buffer = malloc(new_size);
-    if (!new_buffer) {
-        perror("malloc new_buffer");
-        free(buffer);
-        return 1;
-    }
-
-    /* Set up the disassembler info so we can process instructions. */
-    size_t pc = 0;      /* offset into the input buffer */
-    size_t out_pc = 0;  /* offset into the new (output) buffer */
-
-    stream_state ss = {0};
-    ss.insn_buffer = NULL;
-    ss.reenter = false;
-
-    disassemble_info disasm_info;
-    memset(&disasm_info, 0, sizeof(disasm_info));
-    init_disassemble_info(&disasm_info, &ss, dis_fprintf, dis_fprintf_styled);
-    disasm_info.arch = bfd_arch_i386;
-    disasm_info.mach = bfd_mach_x86_64;
-    disasm_info.read_memory_func = buffer_read_memory;
-    disasm_info.buffer = buffer;
-    disasm_info.buffer_vma = 0;
-    disasm_info.buffer_length = size;
-    disassemble_init_for_target(&disasm_info);
-
-    disassembler_ftype disasm;
-    disasm = disassembler(bfd_arch_i386, false, bfd_mach_x86_64, NULL);
-
-    /* Process the binary instruction by instruction. */
-    while (pc < size) {
-        size_t insn_size = disasm(pc, &disasm_info);
-        if (insn_size == 0) {
-            /* If disassembly fails, copy the rest of the bytes as is and break. */
-            while (pc < size) {
-                new_buffer[out_pc++] = buffer[pc++];
-            }
-            break;
-        }
-
-        /* Check if this instruction is a direct call (opcode 0xE8) and has a length of at least 5. */
-        if (buffer[pc] == 0xE8 && insn_size >= 5) {
-            /* Compute new relative offset so that the call goes to our stub.
-             * The call instruction computes its target relative to (pc + insn_size).
-             * Our stub is appended at offset "size" of the new binary.
-             */
-            int32_t new_offset = (int32_t)(size - (pc + insn_size));
-            new_buffer[out_pc++] = 0xE8;
-            new_buffer[out_pc++] = (uint8_t)(new_offset & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_offset >> 8) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_offset >> 16) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_offset >> 24) & 0xFF);
-        }
-        else if (insn_size >= 5 && buffer[pc] == 0x48 && buffer[pc + 1] == 0xBF){
-            // printf("movabs detected!\n");
-            int64_t new_pointer = (int64_t)(&ar);
-            // printf("Offset calculated: %lx\n", new_pointer);
-            new_buffer[out_pc++] = 0x48;
-            new_buffer[out_pc++] = 0xBF;
-            new_buffer[out_pc++] = (uint8_t)(new_pointer & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 8) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 16) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 24) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 32) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 40) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 48) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 56) & 0xFF);
-        }
-        else {
-            /* For all other instructions, copy the bytes unchanged. */
-            for (size_t i = 0; i < insn_size; i++) {
-                new_buffer[out_pc++] = buffer[pc + i];
-            }
-        }
-        pc += insn_size;
-        /* Reset the stream state for the next instruction. */
-        if (ss.insn_buffer) {
-            free(ss.insn_buffer);
-            ss.insn_buffer = NULL;
-            ss.reenter = false;
-        }
-    }
-
-    /* Append the stub function code at the end of the new binary. */
-    memcpy(new_buffer + out_pc, stub_code, stub_size);
-    out_pc += stub_size;
-
-    printf("Patched binary bytes:\n");
-    for (size_t i = 0; i < out_pc; i++) {
-        printf("0x%02X ", new_buffer[i]);
-        if ((i + 1) % 16 == 0)
-            printf("\n");
-    }
-    printf("\n");
-
-    /* Write out the new binary. */
-    int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    if (out_fd < 0) {
-        perror("open output file");
-        free(buffer);
-        free(new_buffer);
-        return 1;
-    }
-    if (write(out_fd, new_buffer, out_pc) != (ssize_t)out_pc) {
-        perror("write output file");
-        free(buffer);
-        free(new_buffer);
-        close(out_fd);
-        return 1;
-    }
-    close(out_fd);
-
-    free(buffer);
-    free(new_buffer);
+    *buf_out = buf;
+    *len_out = text.sh_size;
     return 0;
 }
 
-int run_timing_loop(const char *patched_file, int num_runs) {
-    int fd = open(patched_file, O_RDONLY);
-    if (fd < 0) {
-        perror("open patched binary");
+/* Initialise disassembler state */
+static void
+init_disassembler(disassemble_info *di, uint8_t *buf, size_t len,
+                  stream_state *ss)
+{
+    memset(di, 0, sizeof *di);
+    init_disassemble_info(di, ss, dis_fprintf, dis_fprintf_styled);
+    di->arch = bfd_arch_i386;
+    di->mach = bfd_mach_x86_64;
+    di->read_memory_func = buffer_read_memory;
+    di->buffer = buf;
+    di->buffer_vma = 0;
+    di->buffer_length = len;
+    disassemble_init_for_target(di);
+}
+static disassembler_ftype
+pick_disassembler(void)
+{
+    return disassembler(bfd_arch_i386, false, bfd_mach_x86_64, NULL);
+}
+
+// ----------------------------------------------------------------------------
+// Mode‑specific patchers
+// ----------------------------------------------------------------------------
+
+/* Generic patch driver (receives patch lambda) */
+typedef void (*insn_patch_cb)(uint8_t *in, size_t pc, size_t isz, size_t total,
+                              uint8_t *out, size_t *outpc);
+
+static int
+patch_driver(uint8_t *buf, size_t len, const char *outpath, insn_patch_cb patch)
+{
+    uint8_t stub[11];
+    build_stub(stub);
+    uint8_t *outbuf = malloc(len + sizeof stub);
+
+    stream_state ss = { 0 };
+    disassemble_info di;
+    init_disassembler(&di, buf, len, &ss);
+    disassembler_ftype dis = pick_disassembler();
+
+    size_t pc = 0, out = 0;
+    while (pc < len) {
+        size_t isz = dis(pc, &di);
+        if (!isz) {
+            outbuf[out++] = buf[pc++];
+            continue;
+        }
+        patch(buf, pc, isz, len, outbuf, &out);
+        pc += isz;
+    }
+    memcpy(outbuf + out, stub, sizeof stub);
+    out += sizeof stub;
+
+    int ofd = open(outpath, O_CREAT | O_TRUNC | O_WRONLY, 0755);
+    if (ofd < 0 || write(ofd, outbuf, out) != (ssize_t)out) {
+        perror("write");
+        free(outbuf);
         return 1;
     }
+    close(ofd);
+    free(outbuf);
+    return 0;
+}
 
-    int size = fileSize(fd);
-    if (size < 0) {
-        perror("fileSize");
+/* WASM specific patch callbacks */
+static void
+patch_wasm_cb(uint8_t *in, size_t pc, size_t isz, size_t total, uint8_t *out,
+              size_t *p)
+{
+    if (in[pc] == 0xE8 && isz >= 5) {
+        int32_t rel = (int32_t)(total - (pc + isz));
+        out[(*p)++] = 0xE8;
+        memcpy(out + *p, &rel, 4);
+        *p += 4;
+    }
+    else {
+        memcpy(out + *p, in + pc, isz);
+        *p += isz;
+    }
+}
+
+/* C specific patch callbacks */
+static void
+patch_c_cb(uint8_t *in, size_t pc, size_t isz, size_t total, uint8_t *out,
+           size_t *p)
+{
+    bool handled = false;
+    if (isz >= 7 && in[pc] == 0x48 && in[pc + 1] == 0x8D
+        && in[pc + 2] == 0x3D) {
+        int32_t disp = (int32_t)((uint64_t)&ar - (uint64_t)(pc + isz));
+        out[(*p)++] = 0x48;
+        out[(*p)++] = 0x8D;
+        out[(*p)++] = 0x3D;
+        memcpy(out + *p, &disp, 4);
+        *p += 4;
+        handled = true;
+    }
+    if (!handled && in[pc] == 0xE8 && isz >= 5) {
+        int32_t rel = (int32_t)(total - (pc + isz));
+        out[(*p)++] = 0xE8;
+        memcpy(out + *p, &rel, 4);
+        *p += 4;
+        handled = true;
+    }
+    if (!handled) {
+        memcpy(out + *p, in + pc, isz);
+        *p += isz;
+    }
+}
+
+/* eBPF patch callback */
+static void
+patch_ebpf_cb(uint8_t *in, size_t pc, size_t isz, size_t total, uint8_t *out,
+              size_t *p)
+{
+    bool handled = false;
+    if (in[pc] == 0xE8 && isz >= 5) {
+        int32_t rel = (int32_t)(total - (pc + isz));
+        out[(*p)++] = 0xE8;
+        memcpy(out + *p, &rel, 4);
+        *p += 4;
+        handled = true;
+    }
+    else if (isz >= 10 && in[pc] == 0x48 && in[pc + 1] == 0xBF) {
+        uint64_t ptr = (uint64_t)&ar;
+        out[(*p)++] = 0x48;
+        out[(*p)++] = 0xBF;
+        memcpy(out + *p, &ptr, 8);
+        *p += 8;
+        handled = true;
+    }
+    if (!handled) {
+        memcpy(out + *p, in + pc, isz);
+        *p += isz;
+    }
+}
+
+//-------------------------------- Dispatchers --------------------------------
+static int
+patch_binary_wasm(const char *in, const char *out)
+{
+    uint8_t *buf;
+    size_t len;
+    if (load_elf_text(in, &buf, &len) != 0)
+        return 1;
+    int r = patch_driver(buf, len, out, patch_wasm_cb);
+    free(buf);
+    return r;
+}
+static int
+patch_binary_c(const char *in, const char *out)
+{
+    uint8_t *buf;
+    size_t len;
+    if (load_elf_text(in, &buf, &len) != 0)
+        return 1;
+    int r = patch_driver(buf, len, out, patch_c_cb);
+    free(buf);
+    return r;
+}
+static int
+patch_binary_ebpf(const char *in, const char *out)
+{
+    int fd = open(in, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    int len = file_size(fd);
+    if (len < 0) {
+        perror("size");
         close(fd);
         return 1;
     }
+    uint8_t *buf = malloc(len);
+    if (!buf || read(fd, buf, len) != len) {
+        perror("read");
+        free(buf);
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    int r = patch_driver(buf, len, out, patch_ebpf_cb);
+    free(buf);
+    return r;
+}
 
-    void *pointer = mmap(NULL, size, PROT_EXEC, MAP_SHARED, fd, 0);
-    if (pointer == MAP_FAILED) {
+// ----------------------------------------------------------------------------
+// Timing harness
+// ----------------------------------------------------------------------------
+static int
+run_timing_loop(const char *patched_file, int runs)
+{
+    int fd = open(patched_file, O_RDONLY);
+    if (fd < 0) {
+        perror("open patched");
+        return 1;
+    }
+    int len = file_size(fd);
+    if (len < 0) {
+        perror("size");
+        close(fd);
+        return 1;
+    }
+    void *ptr = mmap(NULL, len, PROT_EXEC, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
         perror("mmap");
         close(fd);
         return 1;
     }
     close(fd);
+    void (*fun)(void *) = (void (*)(void *))ptr;
+    uint8_t arg[0x40] = { 0 };
+    *(uint64_t *)(arg + 0x10) = (uint64_t)ar;
+    *(uint64_t *)(arg + 0x30) = (uint64_t)ar;
+    *(uint64_t *)(arg + 0x38) = (uint64_t)ar;
 
-    // create the function pointer to the executable binary in memory
-    // by casting the pointer to a function type, include an array
-    // as an input argument and one unused argument to stand in for the
-    // default wasm struct
-    void (*fptr)(void *) = (void (*)(void *)) pointer;
+    unsigned long long start = rdtscl();
 
-    // Build a simple argument buffer that the raw assembly code expects.
-    // For example, the assembly is reading:
-    //   mov  0x10(%rdi), %rbx
-    //   mov  0x30(%rdi), %r14
-    //   mov  0x38(%rdi), %rax
-    // We'll set these fields to point to our global 'ar' array.
-    uint8_t argbuf[0x40] = { 0 };
-    // Write the pointer to ar at offset 0x10.
-    *(uint64_t*)(argbuf + 0x10) = (uint64_t) ar;
-    // Write the pointer to ar at offset 0x30.
-    *(uint64_t*)(argbuf + 0x30) = (uint64_t) ar;
-    // Write the pointer to ar at offset 0x38.
-    *(uint64_t*)(argbuf + 0x38) = (uint64_t) ar;
-
-    unsigned long long elapsed = 0;
-    unsigned long long start, end = 0;
-    start = rdtscl();
-
-    for (int i = 0; i < num_runs; i++) {
-        // Call the executable function, passing our argument buffer.
-        fptr(argbuf);
+    // Run the function
+    for (int i = 0; i < runs; ++i) {
+        fun(arg);
     }
 
-    end = rdtscl();
-    elapsed += end - start;
+    unsigned long long end = rdtscl();
 
-    // clock_gettime(CLOCK_REALTIME, &end);
-    // long long start_ns = start.tv_sec * 1000000000LL + start.tv_nsec;
-    // long long end_ns = end.tv_sec * 1000000000LL + end.tv_nsec;
-    // long long elapsed_ns = end_ns - start_ns;
-    // total_elapsed_ns += elapsed_ns;
-    // ./binary-funct-writer-wasm.o array-aot.o 1000000000
-    // ./binary-func-writer.o non-inlined-bpf-array.o 1000000000
-    // ./c-binary-rewriter.o array-c.o 1000000000
-
-    // double average_ns = (double) total_elapsed_ns / num_runs;
-    // printf("Executed patched binary %d times\n", num_runs);
-    // printf("Total elapsed time: %lld ns\n", total_elapsed_ns);
-    // printf("Average time per execution: %.2f ns\n", average_ns);
-    // printf("eBPF execution time:\n");
-    // printf("Executed %d times, took: %lld ns total | Average time: %.2f ns\n", num_runs, total_elapsed_ns, average_ns);
-
-    double average_cycle_count = (double) elapsed/num_runs;
-    printf("EBPF execution time:\n");
-    printf("Executed %d time(s), Average cycles: %f\n",
-        num_runs, average_cycle_count);
-
-    munmap(pointer, size);
+    printf("Executed %d runs – average cycles: %.2f\n", runs,
+           (double)(end - start) / runs);
+    munmap(ptr, len);
     return 0;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input_binary> <num_runs>\n", argv[0]);
+static int
+patch_dispatch(const char *mode, const char *in, const char *out)
+{
+    if (strcmp(mode, "wasm") == 0)
+        return patch_binary_wasm(in, out);
+    if (strcmp(mode, "c") == 0)
+        return patch_binary_c(in, out);
+    if (strcmp(mode, "ebpf") == 0)
+        return patch_binary_ebpf(in, out);
+    fprintf(stderr, "Unknown mode '%s' – use wasm|c|ebpf\n", mode);
+    return 1;
+}
+
+int
+main(int argc, char **argv)
+{
+    bool hexdump = false;
+    int argi = 1;
+    if (argc == 5 && strcmp(argv[1], "--hexdump") == 0) {
+        hexdump = true;
+        argi = 2;
+    }
+    if (argc - argi != 3) {
+        fprintf(stderr,
+                "Usage: %s [--hexdump] <wasm|c|ebpf> <input_bin> <num_runs>\n",
+                argv[0]);
         return 1;
     }
 
-    const char *input_file = argv[1];
-    int num_runs = atoi(argv[2]);
-    if (num_runs <= 0) {
-        fprintf(stderr, "Number of runs must be positive.\n");
+    const char *mode = argv[argi];
+    const char *in = argv[argi + 1];
+    int runs = atoi(argv[argi + 2]);
+    if (runs <= 0) {
+        fprintf(stderr, "num_runs must be >0\n");
         return 1;
     }
 
-    const char *patched_file = "bpf-binary-patched.o";
+    const char *out = "patched-binary.o";
 
-    /* Patch the input binary. */
-    if (patch_binary(input_file, patched_file) != 0) {
-        fprintf(stderr, "Error patching the binary.\n");
+    /* perform patch */
+    if (patch_dispatch(mode, in, out) != 0)
         return 1;
-    }
 
-    /* Run the patched binary in a timing loop. */
-    if (run_timing_loop(patched_file, num_runs) != 0) {
-        fprintf(stderr, "Error running the timing loop.\n");
+    /* run timing harness */
+    if (run_timing_loop(out, runs) != 0)
         return 1;
+
+    if (hexdump) {
+        int fd = open(out, O_RDONLY);
+        if (fd < 0) {
+            perror("open for hexdump");
+        }
+        else {
+            int sz = file_size(fd);
+            uint8_t *buf = malloc(sz);
+            if (!buf) {
+                fprintf(stderr, "malloc failed for hexdump buffer\n");
+            }
+            else if (read(fd, buf, sz) != sz) {
+                perror("hexdump read");
+                free(buf);
+            }
+            else {
+                for (int i = 0; i < sz; i++) {
+                    printf("%02x", buf[i]);
+                }
+                printf("\n");
+                free(buf);
+            }
+            close(fd);
+        }
     }
 
     return 0;
