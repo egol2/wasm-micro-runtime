@@ -31,6 +31,11 @@
 typedef uint32_t __u32;
 static __u32 ar[256] = { 0 }; // buffer returned by the stub in every mode
 
+static bool g_insn_hexdump = false;
+
+// for wasm starting function
+#define HOTPATCH_SKIP 0x10
+
 static unsigned long long
 rdtscl(void)
 {
@@ -71,10 +76,10 @@ static void
 build_stub(uint8_t out[11])
 {
     uint64_t ptr = (uint64_t)&ar;
-    out[0] = 0x48; // movabs
-    out[1] = 0xB8; // rax
+    out[0] = 0x48;            // movabs
+    out[1] = 0xB8;            // rax
     memcpy(out + 2, &ptr, 8); // address of ar
-    out[10] = 0xC3; // ret
+    out[10] = 0xC3;           // ret
 }
 
 //-------------------------------- ELF loader ---------------------------------
@@ -194,15 +199,26 @@ patch_driver(uint8_t *buf, size_t len, const char *outpath, insn_patch_cb patch)
     disassembler_ftype dis = pick_disassembler();
 
     size_t pc = 0, out = 0;
+
+    if (g_insn_hexdump)
+        printf("Original hex:\n");
+
     while (pc < len) {
         size_t isz = dis(pc, &di);
         if (!isz) {
             outbuf[out++] = buf[pc++];
             continue;
         }
+        if (g_insn_hexdump) {
+            for (size_t i = 0; i < isz; i++) {
+                printf("%02x", buf[pc + i]);
+            }
+        }
         patch(buf, pc, isz, len, outbuf, &out);
         pc += isz;
     }
+    if (g_insn_hexdump)
+        printf("\n");
     memcpy(outbuf + out, stub, sizeof stub);
     out += sizeof stub;
 
@@ -298,7 +314,17 @@ patch_binary_wasm(const char *in, const char *out)
     size_t len;
     if (load_elf_text(in, &buf, &len) != 0)
         return 1;
-    int r = patch_driver(buf, len, out, patch_wasm_cb);
+
+    // skip the hot-patch header
+    if (len <= HOTPATCH_SKIP) {
+        fprintf(stderr, "%s: .text too small for skip\n", in);
+        free(buf);
+        return 1;
+    }
+    uint8_t *body = buf + HOTPATCH_SKIP;
+    size_t body_len = len - HOTPATCH_SKIP;
+
+    int r = patch_driver(body, body_len, out, patch_wasm_cb);
     free(buf);
     return r;
 }
@@ -364,7 +390,10 @@ run_timing_loop(const char *patched_file, int runs)
         return 1;
     }
     close(fd);
+    // create function pointer to executable patched binary
     void (*fun)(void *) = (void (*)(void *))ptr;
+
+    // setup array for the argument for the patched binary function
     uint8_t arg[0x40] = { 0 };
     *(uint64_t *)(arg + 0x10) = (uint64_t)ar;
     *(uint64_t *)(arg + 0x30) = (uint64_t)ar;
@@ -403,16 +432,17 @@ main(int argc, char **argv)
 {
     bool hexdump = false;
     int argi = 1;
-    if (argc == 5 && strcmp(argv[1], "--hexdump") == 0) {
+    if (argc == 5 && strcmp(argv[1], "-v") == 0) {
         hexdump = true;
         argi = 2;
     }
     if (argc - argi != 3) {
-        fprintf(stderr,
-                "Usage: %s [--hexdump] <wasm|c|ebpf> <input_bin> <num_runs>\n",
+        fprintf(stderr, "Usage: %s [-v] <wasm|c|ebpf> <input_bin> <num_runs>\n",
                 argv[0]);
         return 1;
     }
+
+    g_insn_hexdump = hexdump;
 
     const char *mode = argv[argi];
     const char *in = argv[argi + 1];
@@ -424,37 +454,37 @@ main(int argc, char **argv)
 
     const char *out = "patched-binary.o";
 
-    /* perform patch */
+    // Patch the binary
     if (patch_dispatch(mode, in, out) != 0)
         return 1;
 
-    /* run timing harness */
+    // Run the patched binary
     if (run_timing_loop(out, runs) != 0)
         return 1;
 
     if (hexdump) {
-        int fd = open(out, O_RDONLY);
-        if (fd < 0) {
-            perror("open for hexdump");
+        int pfd = open(out, O_RDONLY);
+        if (pfd < 0) {
+            perror("open patched for hexdump");
         }
         else {
-            int sz = file_size(fd);
-            uint8_t *buf = malloc(sz);
-            if (!buf) {
-                fprintf(stderr, "malloc failed for hexdump buffer\n");
+            int psz = file_size(pfd);
+            uint8_t *pbuf = malloc(psz);
+            if (!pbuf) {
+                fprintf(stderr, "malloc failed for patched hexdump buffer\n");
             }
-            else if (read(fd, buf, sz) != sz) {
-                perror("hexdump read");
-                free(buf);
+            else if (read(pfd, pbuf, psz) != psz) {
+                perror("hexdump read patched");
+                free(pbuf);
             }
             else {
-                for (int i = 0; i < sz; i++) {
-                    printf("%02x", buf[i]);
-                }
+                printf("Patched hex:\n");
+                for (int i = 0; i < psz; i++)
+                    printf("%02x", pbuf[i]);
                 printf("\n");
-                free(buf);
+                free(pbuf);
             }
-            close(fd);
+            close(pfd);
         }
     }
 
