@@ -13,11 +13,24 @@
 // #include <sys/times.h>
 #include <sys/mman.h>
 #include <dis-asm.h>
+#include <elf.h>
+
+// SECTION NAME STRING
+#define SECTION ".text"
+
+#define SECONDS      1000000000
+#define MILLISECONDS 1000000
+#define MICROSECONDS 1000
+#define NANOSECONDS  1
 
 typedef struct {
     char *insn_buffer;
     bool reenter;
 } stream_state;
+
+// definition for inside the wasm executable
+typedef uint32_t __u32;
+static __u32 ar[256] = { 0 };
 
 // timer helper function for TSC (time stamp counter)
 // https://stackoverflow.com/questions/14017894/time-calculation-with-tsc-time-stamp-counter
@@ -30,9 +43,22 @@ unsigned long long rdtscl(void)
     return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
 }
 
-// definition for inside the wasm executable
-typedef uint32_t __u32;
-static __u32 ar[256] = { 0 };
+// volatile unsigned long current_time;
+
+// static void *clock_handler() {
+// 	static time_t monotonic_start;
+// 	struct timeval t = {.tv_sec = 1, .tv_usec = 0};
+// 	struct timespec ts;
+
+// 	clock_gettime(CLOCK_MONOTONIC, &ts);
+// 	monotonic_start = ts.tv_sec - 2;
+
+// 	for (;;) {
+// 		clock_gettime(CLOCK_MONOTONIC, &ts);
+// 		current_time = ts.tv_sec - monotonic_start;
+// 		usleep(1 * MICROSECONDS);
+// 	}
+// }
 
 static int dis_fprintf(void *stream, const char *fmt, ...) {
     // stream_state *ss = (stream_state *)stream;
@@ -54,7 +80,8 @@ static int dis_fprintf(void *stream, const char *fmt, ...) {
     return 0;
 }
 
-static int dis_fprintf_styled(void *stream, enum disassembler_style style, const char *fmt, ...) {
+static int dis_fprintf_styled(void *stream, enum disassembler_style style,
+    const char *fmt, ...) {
     // stream_state *ss = (stream_state *)stream;
     // va_list arg;
     // va_start(arg, fmt);
@@ -86,10 +113,12 @@ int fileSize(int fd) {
 /*
  * patch_binary:
  *
- *   Reads the input file (binary to patch), disassembles it instruction-by-instruction,
- *   and patches any direct call (opcode 0xE8) by computing a new relative offset
- *   so that the call targets our stub function. It then appends the stub (a minimal function)
- *   to the end and writes the new binary to output_file.
+ *   Reads the input ELF file (the relocatable wasm binary), extracts only the code
+ *   for aot_func#1 (which is in .text, starting at file offset 0x50 for 305 bytes),
+ *   disassembles and patches it instruction-by-instruction (patching direct calls and
+ *   absolute movabs instructions to fix pointers), and then appends a stub function.
+ *
+ *   The stub function returns the address of the global array 'ar'.
  */
 int patch_binary(const char *input_file, const char *output_file) {
     int fd = open(input_file, O_RDONLY);
@@ -97,31 +126,72 @@ int patch_binary(const char *input_file, const char *output_file) {
         perror("open input file");
         return 1;
     }
-    int size = fileSize(fd);
-    if (size < 0) {
-        perror("fileSize");
+
+    // Read ELF header
+    Elf64_Ehdr ehdr;
+    if (lseek(fd, 0, SEEK_SET) < 0 ||
+        read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+        perror("read ELF header"); close(fd); return 1;
+    }
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "Not an ELF file\n"); close(fd); return 1;
+    }
+
+    // Read section header string table header
+    off_t shoff      = ehdr.e_shoff;
+    uint16_t shentsz = ehdr.e_shentsize;
+    uint16_t shnum   = ehdr.e_shnum;
+    uint16_t strndx  = ehdr.e_shstrndx;
+
+    Elf64_Shdr shstr_sh;
+    if (lseek(fd, shoff + (off_t)strndx * shentsz, SEEK_SET) < 0 ||
+        read(fd, &shstr_sh, sizeof(shstr_sh)) != sizeof(shstr_sh)) {
+        perror("read shstrtab header"); close(fd); return 1;
+    }
+
+    // Load section header string table
+    char *shstrtab = malloc(shstr_sh.sh_size);
+    if (!shstrtab) { perror("malloc shstrtab"); close(fd); return 1; }
+    if (lseek(fd, shstr_sh.sh_offset, SEEK_SET) < 0 ||
+        read(fd, shstrtab, shstr_sh.sh_size) != (ssize_t)shstr_sh.sh_size) {
+        perror("read shstrtab"); free(shstrtab); close(fd); return 1;
+    }
+
+    // Locate section specified by SECTION string
+    off_t text_off = 0;
+    size_t text_size = 0;
+    for (int i = 0; i < shnum; i++) {
+        Elf64_Shdr sh;
+        if (lseek(fd, shoff + (off_t)i * shentsz, SEEK_SET) < 0 ||
+            read(fd, &sh, sizeof(sh)) != sizeof(sh)) {
+            perror("read section header"); free(shstrtab); close(fd); return 1;
+        }
+        const char *name = shstrtab + sh.sh_name;
+        if (strcmp(name, SECTION) == 0) {
+            text_off  = sh.sh_offset;
+            text_size = sh.sh_size;
+            break;
+        }
+    }
+    free(shstrtab);
+
+    if (text_size == 0) {
+        fprintf(stderr, SECTION " section not found\n");
         close(fd);
         return 1;
     }
 
-    uint8_t *buffer = malloc(size);
-    if (!buffer) {
-        perror("malloc");
-        close(fd);
-        return 1;
-    }
-
-    ssize_t bytesRead = read(fd, buffer, size);
-    if (bytesRead != size) {
-        perror("read");
-        free(buffer);
-        close(fd);
-        return 1;
+    // Read .text section
+    uint8_t *buffer = malloc(text_size);
+    if (!buffer) { perror("malloc text buffer"); close(fd); return 1; }
+    if (lseek(fd, text_off, SEEK_SET) < 0 ||
+        read(fd, buffer, text_size) != (ssize_t)text_size) {
+        perror("read "SECTION" failed"); free(buffer); close(fd); return 1;
     }
     close(fd);
 
-    // printf("buffer original:\n");
-    // for (size_t i = 0; i < size; i++) {
+    // printf("Extracted function (aot_func#1) bytes:\n");
+    // for (size_t i = 0; i < func_size; i++) {
     //     printf("0x%02X ", buffer[i]);
     //     if ((i + 1) % 16 == 0)
     //         printf("\n");
@@ -138,25 +208,28 @@ int patch_binary(const char *input_file, const char *output_file) {
         0, 0, 0, 0, 0, 0, 0, 0, // placeholder for the 8-byte address of 'ar'
         0xC3              // ret
     };
-
     // Fill in the immediate field with the address of the global array variable 'ar'
     uint64_t ptr = (uint64_t)&ar;
     memcpy(stub_code + 2, &ptr, sizeof(ptr));
     size_t stub_size = sizeof(stub_code);
 
-    /* The new binary will contain the original code (possibly patched)
-     * plus the stub function appended at the end.
-     */
-    size_t new_size = size + stub_size;
+    // Prepare output buffer
+    size_t func_size = text_size;
+    size_t new_size  = func_size + stub_size;
     uint8_t *new_buffer = malloc(new_size);
-    if (!new_buffer) {
-        perror("malloc new_buffer");
-        free(buffer);
-        return 1;
-    }
+    if (!new_buffer) { perror("malloc new_buffer"); free(buffer); return 1; }
 
-    /* Set up the disassembler info so we can process instructions. */
-    size_t pc = 0;      /* offset into the input buffer */
+    /* The new binary will contain the extracted function (patched) plus the stub appended at the end. */
+    // size_t new_size = func_size + stub_size;
+    // uint8_t *new_buffer = malloc(new_size);
+    // if (!new_buffer) {
+    //     perror("malloc new_buffer");
+    //     free(buffer);
+    //     return 1;
+    // }
+
+    /* Set up the disassembler info to process instructions in the function. */
+    size_t pc = 0;      /* offset into the function buffer */
     size_t out_pc = 0;  /* offset into the new (output) buffer */
 
     stream_state ss = {0};
@@ -170,54 +243,36 @@ int patch_binary(const char *input_file, const char *output_file) {
     disasm_info.mach = bfd_mach_x86_64;
     disasm_info.read_memory_func = buffer_read_memory;
     disasm_info.buffer = buffer;
-    disasm_info.buffer_vma = 0;
-    disasm_info.buffer_length = size;
+    disasm_info.buffer_vma = 0;      // treat offset 0 as beginning of function code
+    disasm_info.buffer_length = func_size;
     disassemble_init_for_target(&disasm_info);
 
     disassembler_ftype disasm;
     disasm = disassembler(bfd_arch_i386, false, bfd_mach_x86_64, NULL);
 
-    /* Process the binary instruction by instruction. */
-    while (pc < size) {
+    /* Process the function code instruction by instruction. */
+    while (pc < func_size) {
         size_t insn_size = disasm(pc, &disasm_info);
         if (insn_size == 0) {
-            /* If disassembly fails, copy the rest of the bytes as is and break. */
-            while (pc < size) {
+            /* On disassembly failure, copy the remaining bytes as-is and break. */
+            while (pc < func_size) {
                 new_buffer[out_pc++] = buffer[pc++];
             }
             break;
         }
-
-        /* Check if this instruction is a direct call (opcode 0xE8) and has a length of at least 5. */
+        /* Patch direct calls: if the opcode is 0xE8 and length >= 5,
+         * compute a new relative offset so that the call reaches our stub.
+         */
         if (buffer[pc] == 0xE8 && insn_size >= 5) {
-            /* Compute new relative offset so that the call goes to our stub.
-             * The call instruction computes its target relative to (pc + insn_size).
-             * Our stub is appended at offset "size" of the new binary.
-             */
-            int32_t new_offset = (int32_t)(size - (pc + insn_size));
+            int32_t new_offset = (int32_t)(func_size - (pc + insn_size));
             new_buffer[out_pc++] = 0xE8;
             new_buffer[out_pc++] = (uint8_t)(new_offset & 0xFF);
             new_buffer[out_pc++] = (uint8_t)((new_offset >> 8) & 0xFF);
             new_buffer[out_pc++] = (uint8_t)((new_offset >> 16) & 0xFF);
             new_buffer[out_pc++] = (uint8_t)((new_offset >> 24) & 0xFF);
         }
-        else if (insn_size >= 5 && buffer[pc] == 0x48 && buffer[pc + 1] == 0xBF){
-            // printf("movabs detected!\n");
-            int64_t new_pointer = (int64_t)(&ar);
-            // printf("Offset calculated: %lx\n", new_pointer);
-            new_buffer[out_pc++] = 0x48;
-            new_buffer[out_pc++] = 0xBF;
-            new_buffer[out_pc++] = (uint8_t)(new_pointer & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 8) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 16) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 24) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 32) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 40) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 48) & 0xFF);
-            new_buffer[out_pc++] = (uint8_t)((new_pointer >> 56) & 0xFF);
-        }
         else {
-            /* For all other instructions, copy the bytes unchanged. */
+            // For all other instructions, copy the bytes unchanged.
             for (size_t i = 0; i < insn_size; i++) {
                 new_buffer[out_pc++] = buffer[pc + i];
             }
@@ -243,7 +298,7 @@ int patch_binary(const char *input_file, const char *output_file) {
     }
     printf("\n");
 
-    /* Write out the new binary. */
+    /* Write out the new binary (which consists solely of the patched function + stub). */
     int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (out_fd < 0) {
         perror("open output file");
@@ -259,7 +314,6 @@ int patch_binary(const char *input_file, const char *output_file) {
         return 1;
     }
     close(out_fd);
-
     free(buffer);
     free(new_buffer);
     return 0;
@@ -287,28 +341,23 @@ int run_timing_loop(const char *patched_file, int num_runs) {
     }
     close(fd);
 
-    // create the function pointer to the executable binary in memory
-    // by casting the pointer to a function type, include an array
-    // as an input argument and one unused argument to stand in for the
-    // default wasm struct
+    // The patched binary now consists solely of aot_func#1 (with patches) plus our stub.
+    // Its function signature is assumed to be: void f(void *arg)
     void (*fptr)(void *) = (void (*)(void *)) pointer;
 
-    // Build a simple argument buffer that the raw assembly code expects.
-    // For example, the assembly is reading:
-    //   mov  0x10(%rdi), %rbx
-    //   mov  0x30(%rdi), %r14
-    //   mov  0x38(%rdi), %rax
-    // We'll set these fields to point to our global 'ar' array.
+    // Build an argument buffer containing pointers expected by the raw assembly.
     uint8_t argbuf[0x40] = { 0 };
-    // Write the pointer to ar at offset 0x10.
+    // At offset 0x10, 0x30, and 0x38 place the address of global 'ar'
     *(uint64_t*)(argbuf + 0x10) = (uint64_t) ar;
-    // Write the pointer to ar at offset 0x30.
     *(uint64_t*)(argbuf + 0x30) = (uint64_t) ar;
-    // Write the pointer to ar at offset 0x38.
     *(uint64_t*)(argbuf + 0x38) = (uint64_t) ar;
 
-    unsigned long long elapsed = 0;
+    /* set up timer thread to avoid measuring overhead */
+    // pthread_t tid;
     unsigned long long start, end = 0;
+    unsigned long long elapsed = 0;
+
+    // init
     start = rdtscl();
 
     for (int i = 0; i < num_runs; i++) {
@@ -318,22 +367,6 @@ int run_timing_loop(const char *patched_file, int num_runs) {
 
     end = rdtscl();
     elapsed += end - start;
-
-    // clock_gettime(CLOCK_REALTIME, &end);
-    // long long start_ns = start.tv_sec * 1000000000LL + start.tv_nsec;
-    // long long end_ns = end.tv_sec * 1000000000LL + end.tv_nsec;
-    // long long elapsed_ns = end_ns - start_ns;
-    // total_elapsed_ns += elapsed_ns;
-    // ./binary-funct-writer-wasm.o array-aot.o 1000000000
-    // ./binary-func-writer.o non-inlined-bpf-array.o 1000000000
-    // ./c-binary-rewriter.o array-c.o 1000000000
-
-    // double average_ns = (double) total_elapsed_ns / num_runs;
-    // printf("Executed patched binary %d times\n", num_runs);
-    // printf("Total elapsed time: %lld ns\n", total_elapsed_ns);
-    // printf("Average time per execution: %.2f ns\n", average_ns);
-    // printf("eBPF execution time:\n");
-    // printf("Executed %d times, took: %lld ns total | Average time: %.2f ns\n", num_runs, total_elapsed_ns, average_ns);
 
     double average_cycle_count = (double) elapsed/num_runs;
     printf("EBPF execution time:\n");
@@ -346,7 +379,7 @@ int run_timing_loop(const char *patched_file, int num_runs) {
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input_binary> <num_runs>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input_elf> <num_runs>\n", argv[0]);
         return 1;
     }
 
@@ -359,7 +392,7 @@ int main(int argc, char *argv[]) {
 
     const char *patched_file = "bpf-binary-patched.o";
 
-    /* Patch the input binary. */
+    /* Patch the input ELF by extracting and patching aot_func#1. */
     if (patch_binary(input_file, patched_file) != 0) {
         fprintf(stderr, "Error patching the binary.\n");
         return 1;
